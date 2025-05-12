@@ -1,9 +1,8 @@
-use super::store::BackendType;
-use crate::errors::Errors;
+use crate::{config::proxy::{Endpoint, Service}, errors::Errors};
 use http::Extensions;
 use pingora::{
     lb::{
-        discovery,
+        discovery::Static,
         selection::{
             algorithms::{Random, RoundRobin},
             consistent::KetamaHashing,
@@ -17,86 +16,67 @@ use pingora::{
 use std::{collections::BTreeSet, sync::Arc};
 
 pub async fn load_backend(
-    svc: &crate::config::proxy::Service,
-    endpoints: &Vec<crate::config::proxy::Endpoint>,
-) -> Result<BackendType, Errors> {
-    let mut backends: BTreeSet<Backend> = BTreeSet::new();
-    for e in endpoints {
-        let endpoint = format!("{}:{}", e.ip, e.port);
-        let addr: SocketAddr = match endpoint.parse() {
-            Ok(val) => val,
-            Err(e) => {
-                return Err(Errors::ConfigError(format!(
-                    "Unable to parse address: {}",
-                    e
-                )));
+    svc: &Service,
+    endpoints: &[Endpoint],
+) -> Result<crate::config::proxy::BackendType, Errors> {
+    // Build a set of raw Backends from endpoints
+    let backends: BTreeSet<Backend> = endpoints
+        .iter()
+        .map(|e| {
+            let ep = format!("{}:{}", e.ip, e.port);
+            let addr: SocketAddr = ep
+                .parse()
+                .map_err(|e| Errors::ConfigError(format!("Invalid address {}: {}", ep, e)))?;
+            let mut b = Backend {
+                addr,
+                weight: e.weight.unwrap_or(1) as usize,
+                ext: Extensions::new(),
+            };
+            if b
+                .ext
+                .insert::<HttpPeer>(HttpPeer::new(ep.clone(), false, String::new()))
+                .is_some()
+            {
+                return Err(Errors::ConfigError("HttpPeer insert failed".into()));
             }
-        };
-        let mut backend = Backend {
-            addr,
-            weight: e.weight.unwrap_or(1) as usize,
-            ext: Extensions::new(),
-        };
-        if backend
-            .ext
-            .insert::<HttpPeer>(HttpPeer::new(endpoint, false, String::new()))
-            .is_some()
-        {
-            return Err(Errors::ConfigError("Unable to insert HttpPeer".to_string()));
-        }
-        backends.insert(backend);
-    }
-    let disco = discovery::Static::new(backends);
-    // Initialize the appropriate iterator based on the algorithm
-    let backend_type = match svc.algorithm.as_str() {
+            Ok(b)
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Initialize and update the selected load balancer
+    let lb = match svc.algorithm.as_str() {
         "round_robin" => {
-            let upstreams =
-                LoadBalancer::<Weighted<RoundRobin>>::from_backends(Backends::new(disco));
-            match upstreams.update().await {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(Errors::PingoraError(format!("{}", e)));
-                }
-            }
-            BackendType::RoundRobin(Arc::new(upstreams))
+            let mut lb = LoadBalancer::<Weighted<RoundRobin>>::from_backends(Backends::new(Static::new(backends)));
+            lb.update()
+                .await
+                .map_err(|e| Errors::PingoraError(e.to_string()))?;
+            crate::config::proxy::BackendType::RoundRobin(Arc::new(lb))
         }
         "weighted" => {
-            let backend =
-                LoadBalancer::<Weighted<fnv::FnvHasher>>::from_backends(Backends::new(disco));
-            match backend.update().await {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(Errors::PingoraError(format!("{}", e)));
-                }
-            }
-            BackendType::Weighted(Arc::new(backend))
+            let mut lb = LoadBalancer::<Weighted<fnv::FnvHasher>>::from_backends(Backends::new(Static::new(backends)));
+            lb.update()
+                .await
+                .map_err(|e| Errors::PingoraError(e.to_string()))?;
+            crate::config::proxy::BackendType::Weighted(Arc::new(lb))
         }
         "consistent" => {
-            let backend = LoadBalancer::<KetamaHashing>::from_backends(Backends::new(disco));
-            match backend.update().await {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(Errors::PingoraError(format!("{}", e)));
-                }
-            }
-            BackendType::Consistent(Arc::new(backend))
+            let mut lb = LoadBalancer::<KetamaHashing>::from_backends(Backends::new(Static::new(backends)));
+            lb.update()
+                .await
+                .map_err(|e| Errors::PingoraError(e.to_string()))?;
+            crate::config::proxy::BackendType::Consistent(Arc::new(lb))
         }
         "random" => {
-            let upstreams = LoadBalancer::<Weighted<Random>>::from_backends(Backends::new(disco));
-            match upstreams.update().await {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(Errors::PingoraError(format!("{}", e)));
-                }
-            }
-            BackendType::Random(Arc::new(upstreams))
+            let mut lb = LoadBalancer::<Weighted<Random>>::from_backends(Backends::new(Static::new(backends)));
+            lb.update()
+                .await
+                .map_err(|e| Errors::PingoraError(e.to_string()))?;
+            crate::config::proxy::BackendType::Random(Arc::new(lb))
         }
-        _ => {
-            return Err(Errors::ConfigError(format!(
-                "Unknown algorithm: {}",
-                svc.algorithm
-            )));
+        other => {
+            return Err(Errors::ConfigError(format!("Unknown algorithm: {}", other)));
         }
     };
-    Ok(backend_type)
+
+    Ok(lb)
 }

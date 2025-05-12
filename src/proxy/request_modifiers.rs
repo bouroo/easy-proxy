@@ -1,6 +1,7 @@
 use super::context::Context;
 use crate::config::proxy::Header;
 use crate::errors::Errors;
+use http::uri::Uri;
 use pingora::proxy::Session;
 
 pub fn headers(
@@ -9,32 +10,31 @@ pub fn headers(
     add_headers: &[Header],
     remove_headers: &[String],
 ) {
-    for header in remove_headers {
-        let _ = session.req_header_mut().remove_header(header.as_str());
+    // remove unwanted headers
+    if !remove_headers.is_empty() {
+        let rh = session.req_header_mut();
+        for name in remove_headers {
+            let _ = rh.remove_header(name);
+        }
     }
 
-    for header in add_headers {
-        let mut value = header.value.clone();
+    // add or override headers
+    for hdr in add_headers {
+        // interpolate ctx.variables: "${key}" → value
+        let mut val = ctx
+            .variables
+            .iter()
+            .fold(hdr.value.clone(), |acc, (k, v)| acc.replace(&format!("${}", k), v));
 
-        // Replace variables in the header value.
-        for (k, v) in &ctx.variables {
-            value = value.replace(&format!("${}", k), v);
-        }
-
-        if value.starts_with("$HK_") {
-            let key = value.replace("$HK_", "").to_ascii_lowercase();
-            let value = session.get_header(&key);
-            if let Some(value) = value.cloned() {
-                let _ = session
-                    .req_header_mut()
-                    .append_header(header.name.clone(), value);
+        // support "$HK_<header>" → copy existing request header
+        if let Some(suffix) = val.strip_prefix("$HK_") {
+            let key = suffix.to_ascii_lowercase();
+            if let Some(orig) = session.get_header(&key).and_then(|v| v.cloned()) {
+                let _ = session.req_header_mut().append_header(hdr.name.clone(), orig);
             }
-            continue;
+        } else {
+            let _ = session.req_header_mut().append_header(hdr.name.clone(), &val);
         }
-
-        let _ = session
-            .req_header_mut()
-            .append_header(header.name.clone(), &value);
     }
 }
 
@@ -43,22 +43,18 @@ pub async fn rewrite(
     path: &str,
     rewrite: &Option<String>,
 ) -> Result<(), Errors> {
-    if let Some(rewrite_str) = rewrite {
-        let query = session.req_header().uri.query();
-        let old_path = session.req_header().uri.path();
-        let new_path = old_path.replace(path, rewrite_str);
-
-        let mut uri = new_path;
-        if let Some(q) = query {
-            uri.push('?');
-            uri.push_str(q);
+    if let Some(r) = rewrite.as_deref() {
+        let req = session.req_header();
+        // replace `path` prefix in the request‐path
+        let mut pq = req.uri.path().replace(path, r);
+        if let Some(q) = req.uri.query() {
+            pq.push('?');
+            pq.push_str(q);
         }
-
-        let new_uri = http::uri::Uri::builder()
-            .path_and_query(&uri)
+        let new_uri = Uri::builder()
+            .path_and_query(pq)
             .build()
             .map_err(|e| Errors::ProxyError(format!("Unable to build URI: {}", e)))?;
-
         session.req_header_mut().set_uri(new_uri);
     }
     Ok(())

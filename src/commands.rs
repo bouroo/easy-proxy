@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::process;
+use std::{
+    fs,
+    io::{self, BufRead, BufReader, BufWriter, Write},
+    os::unix::net::{UnixListener, UnixStream},
+    process::exit,
+};
+use tokio::runtime::Runtime;
 
 const SOCKET_PATH: &str = "/tmp/easy-proxy.sock";
 
@@ -13,201 +17,114 @@ pub struct Commands {
 
 impl Commands {
     pub fn run() {
-        // Remove the socket file if it exists
-        if let Err(e) = std::fs::remove_file(SOCKET_PATH) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::error!("Error removing socket file {}: {:?}", SOCKET_PATH, e);
-                std::process::exit(1);
+        // Remove existing socket file
+        if let Err(e) = fs::remove_file(SOCKET_PATH) {
+            if e.kind() != io::ErrorKind::NotFound {
+                tracing::error!("Failed to remove {}: {:?}", SOCKET_PATH, e);
+                exit(1);
             }
         }
-
         // Bind to the socket
-        let listener = match UnixListener::bind(SOCKET_PATH) {
-            Ok(listener) => {
-                tracing::info!("Listening on {}", SOCKET_PATH);
-                listener
-            }
-            Err(e) => {
-                tracing::error!("Unable to bind to {}: {:?}", SOCKET_PATH, e);
-                std::process::exit(1);
-            }
-        };
-
-        // Accept connections in a loop
-        for stream_result in listener.incoming() {
-            match stream_result {
-                Ok(stream) => {
-                    handle_connection(stream);
+        let listener = UnixListener::bind(SOCKET_PATH).unwrap_or_else(|e| {
+            tracing::error!("Bind {} error: {:?}", SOCKET_PATH, e);
+            exit(1);
+        });
+        tracing::info!("Listening on {}", SOCKET_PATH);
+        // Reuse a single Tokio runtime
+        let rt = Runtime::new().unwrap();
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    if let Err(e) = handle_connection(s, &rt) {
+                        tracing::error!("Connection error: {:?}", e);
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Error accepting connection: {:?}", e);
-                }
+                Err(e) => tracing::error!("Accept error: {:?}", e),
             }
         }
     }
 
     pub fn send_command(command_str: &str) {
-        // Connect to the main socket
-        let mut stream = match UnixStream::connect(SOCKET_PATH) {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::error!("Unable to connect to {}: {:?}", SOCKET_PATH, e);
-                std::process::exit(1);
-            }
+        // Connect and wrap in buffered I/O
+        let mut stream = UnixStream::connect(SOCKET_PATH).unwrap_or_else(|e| {
+            tracing::error!("Connect {} error: {:?}", SOCKET_PATH, e);
+            exit(1);
+        });
+        let cmd = Commands {
+            message_type: "command".into(),
+            message: command_str.into(),
         };
+        let mut writer = BufWriter::new(&stream);
+        serde_json::to_writer(&mut writer, &cmd).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
 
-        // Prepare the command to send
-        let command = Commands {
-            message_type: "command".to_string(),
-            message: command_str.to_string(),
-        };
-        let command_json = match serde_json::to_string(&command) {
-            Ok(json) => json,
-            Err(e) => {
-                tracing::error!("Error serializing command: {:?}", e);
-                return;
-            }
-        };
-
-        // Send the command
-        if let Err(e) = stream.write_all(command_json.as_bytes()) {
-            tracing::error!("Error sending command: {:?}", e);
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            tracing::error!("Empty response");
             return;
         }
-
-        // Read the response
-        let mut buffer = [0; 1024];
-        match stream.read(&mut buffer) {
-            Ok(n) => {
-                if n == 0 {
-                    tracing::error!("Received empty response");
-                    return;
+        match serde_json::from_str::<Commands>(line.trim()) {
+            Ok(res) => match res.message_type.as_str() {
+                "error" => {
+                    tracing::error!("{}", res.message);
+                    exit(1);
                 }
-                if n >= buffer.len() {
-                    tracing::error!("Response too large");
-                    return;
-                }
-                let response_str = std::str::from_utf8(&buffer[..n]).unwrap_or_default().trim();
-                let res_command: Commands = match serde_json::from_str(response_str) {
-                    Ok(cmd) => cmd,
-                    Err(e) => {
-                        tracing::error!("Error deserializing response: {:?}", e);
-                        return;
-                    }
-                };
-                if res_command.message_type == "error" {
-                    tracing::error!("{}", res_command.message);
-                    process::exit(1);
-                } else {
-                    tracing::info!("{}", res_command.message);
-                }
-            }
-            Err(e) => {
-                tracing::error!("Error reading response: {:?}", e);
-            }
+                _ => tracing::info!("{}", res.message),
+            },
+            Err(e) => tracing::error!("Invalid response: {:?}", e),
         }
     }
 }
 
-fn handle_connection(mut stream: UnixStream) {
-    let mut buffer = [0; 1024];
-    match stream.read(&mut buffer) {
-        Ok(n) => {
-            if n == 0 {
-                return;
-            }
-            let buffer = &buffer[..n];
-            // Process the command
-            if let Err(e) = process_command(&mut stream, buffer) {
-                tracing::error!("Error processing command: {:?}", e);
-            }
-        }
-        Err(e) => {
-            tracing::error!("Error reading from stream: {:?}", e);
-        }
+fn handle_connection(stream: UnixStream, rt: &Runtime) -> io::Result<()> {
+    let mut reader = BufReader::new(&stream);
+    let mut writer = BufWriter::new(&stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(());
     }
-}
-
-fn process_command(
-    stream: &mut UnixStream,
-    buffer: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut res_command = Commands {
-        message_type: "response".to_string(),
+    let cmd: Commands =
+        serde_json::from_str(line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut res = Commands {
+        message_type: "response".into(),
         message: String::new(),
     };
-    let command_str = std::str::from_utf8(buffer)?.trim();
-    let command: Commands = serde_json::from_str(command_str)?;
-
-    if command.message_type == "command" {
-        match command.message.as_str() {
-            "reload" => {
-                handle_reload_command(stream, &mut res_command)?;
-            }
-            "test" => {
-                handle_test_command(stream, &mut res_command)?;
-            }
-            _ => {
-                tracing::info!("Received unknown command: {:?}", command.message);
-            }
+    if cmd.message_type == "command" {
+        match cmd.message.as_str() {
+            "reload" => rt.block_on(async {
+                match crate::config::proxy::load().await {
+                    Ok(_) => res.message = "Proxy configuration loaded successfully".into(),
+                    Err(e) => {
+                        tracing::error!("Error loading proxy config: {:?}", e);
+                        res.message_type = "error".into();
+                        res.message = format!("Error: {:?}", e);
+                    }
+                }
+            }),
+            "test" => rt.block_on(async {
+                match crate::config::proxy::read().await {
+                    Ok(c) => match crate::config::store::load(c).await {
+                        Ok(_) => res.message = "Proxy configuration tested successfully".into(),
+                        Err(e) => {
+                            tracing::error!("Error loading proxy config: {:?}", e);
+                            res.message_type = "error".into();
+                            res.message = format!("Error loading proxy config: {:?}", e);
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!("Error reading proxy config: {:?}", e);
+                        res.message_type = "error".into();
+                        res.message = format!("Error reading proxy config: {:?}", e);
+                    }
+                }
+            }),
+            other => tracing::info!("Unknown command: {}", other),
         }
     }
+    serde_json::to_writer(&mut writer, &res)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
     Ok(())
-}
-
-fn handle_reload_command(
-    stream: &mut UnixStream,
-    res_command: &mut Commands,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        match crate::config::proxy::load().await {
-            Ok(_) => {
-                tracing::info!("Proxy configuration loaded successfully");
-                res_command.message = "Proxy configuration loaded successfully".to_string();
-            }
-            Err(e) => {
-                tracing::error!("Error loading proxy configuration: {:?}", e);
-                res_command.message_type = "error".to_string();
-                res_command.message = format!("Error: {:?}", e);
-            }
-        }
-        // Send response
-        let res_command_str = serde_json::to_string(&res_command)?;
-        stream.write_all(res_command_str.as_bytes())?;
-        stream.flush()?;
-        Ok(())
-    })
-}
-
-fn handle_test_command(
-    stream: &mut UnixStream,
-    res_command: &mut Commands,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        match crate::config::proxy::read().await {
-            Ok(c) => match crate::config::store::load(c).await {
-                Ok(_) => {
-                    tracing::info!("Proxy configuration tested successfully");
-                    res_command.message = "Proxy configuration tested successfully".to_string();
-                }
-                Err(e) => {
-                    tracing::error!("Error loading proxy configuration: {:?}", e);
-                    res_command.message_type = "error".to_string();
-                    res_command.message = format!("Error loading proxy configuration: {:?}", e);
-                }
-            },
-            Err(e) => {
-                tracing::error!("Error reading proxy configuration: {:?}", e);
-                res_command.message_type = "error".to_string();
-                res_command.message = format!("Error reading proxy configuration: {:?}", e);
-            }
-        }
-        // Send response
-        let res_command_str = serde_json::to_string(&res_command)?;
-        stream.write_all(res_command_str.as_bytes())?;
-        stream.flush()?;
-        Ok(())
-    })
 }

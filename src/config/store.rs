@@ -1,55 +1,43 @@
-use super::{
-    backend::load_backend,
-    certs::load_cert,
-    proxy::{read, Acme, AcmeProvider, Header, Path, ProxyConfig, ServiceReference, Tls, TlsRoute},
-    runtime,
-};
-use crate::{
-    acme::{client::AcmeClient, crypto::AcmeKeyPair},
-    errors::Errors,
-    utils,
-};
-use openssl::x509::X509;
+use crate::{acme::client::AcmeClient, acme::crypto::AcmeKeyPair, config::runtime, errors::Errors, utils};
+use http::Extensions;
+use openssl::{pkey::PKey, x509::X509};
+use once_cell::sync::{Lazy, OnceCell};
 use pingora::{
-    lb::{
-        selection::{
-            algorithms::{Random, RoundRobin},
-            consistent::KetamaHashing,
-            weighted::Weighted,
-        },
-        LoadBalancer,
-    },
-    tls::pkey::PKey,
+    lb::{LoadBalancer, discovery::Static, Backends},
+    prelude::HttpPeer,
+    protocols::l4::socket::SocketAddr,
+    tls::pkey::PKey as _,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::{collections::HashMap, sync::LazyLock};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
+use super::{
+    backend::load_backend, certs::load_cert, proxy::{
+        Header, Path, ProxyConfig, ServiceReference, Tls, TlsRoute,
+    }, store::{TlsGlobalConfig, BackendType},
+};
 
-// proxy global store
-static mut GLOBAL_PROXY_CONFIG: *mut ProxyStore = std::ptr::null_mut();
-static mut GLOBAL_TLS_CONFIG: *mut HashMap<String, TlsGlobalConfig> = std::ptr::null_mut();
+/// Global proxy and TLS storage
+static PROXY_STORE: OnceCell<ProxyStore> = OnceCell::new();
+static TLS_CONFIG: OnceCell<HashMap<String, TlsGlobalConfig>> = OnceCell::new();
 
-// acme global store
-static ACME_STORE_DEFAULT: &str = "/etc/easy-proxy/tls/acme.json";
-// tls acme request queue
-//  - key: tls name
-//  - value: email, vec<domain>
-static mut ACME_REQUEST_QUEUE: *mut HashMap<String, (Acme, Vec<String>)> = std::ptr::null_mut();
-static mut ACME_IN_PROGRESS: bool = false;
-static mut ACME_RETRY_COUNT: *mut HashMap<String, u8> = std::ptr::null_mut();
-static mut ACME_AUTHZ: *mut HashMap<String, String> = std::ptr::null_mut();
-// acme provider directory
-static ACME_PROVIDERS: LazyLock<HashMap<AcmeProvider, String>> = LazyLock::new(|| {
-    let mut providers = HashMap::new();
-    providers.insert(
-        AcmeProvider::LetsEncrypt,
-        "https://acme-v02.api.letsencrypt.org/directory".to_string(),
-    );
-    providers.insert(
-        AcmeProvider::Buypass,
-        "https://api.buypass.com/acme/directory".to_string(),
-    );
-    providers
+/// ACME globals
+static ACME_REQUEST_QUEUE: Lazy<Mutex<HashMap<String, (Acme, Vec<String>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static ACME_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static ACME_RETRY_COUNT: Lazy<Mutex<HashMap<String, u8>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static ACME_AUTHZ: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static ACME_PROVIDERS: Lazy<HashMap<AcmeProvider, String>> = Lazy::new(|| {
+    let mut m = HashMap::new();
+    m.insert(AcmeProvider::LetsEncrypt, "https://acme-v02.api.letsencrypt.org/directory".into());
+    m.insert(AcmeProvider::Buypass, "https://api.buypass.com/acme/directory".into());
+    m
 });
 
 #[derive(Debug, Clone)]
@@ -59,49 +47,12 @@ pub struct TlsGlobalConfig {
     pub chain: Vec<X509>,
 }
 
-pub enum TlsType {
-    Custom,
-    Acme,
-}
-
-impl TlsType {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "custom" => Some(TlsType::Custom),
-            "acme" => Some(TlsType::Acme),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AcmeStore {
-    // domain -> order id
     pub hostnames: HashMap<String, String>,
-    // email -> account
     pub account: HashMap<String, (String, AcmeAccount)>,
-    // order id -> certificate
     pub acme_certs: HashMap<String, AcmeCertificate>,
-    // order id -> expiration (tls name, timestamp)
     pub acme_expires: HashMap<String, (String, i128)>,
-}
-
-impl AcmeStore {
-    pub fn save(&self) -> Result<(), Errors> {
-        let app_conf = &runtime::config();
-        let acme_store_path = app_conf
-            .acme_store
-            .clone()
-            .unwrap_or(ACME_STORE_DEFAULT.to_string());
-        let acme_store_json = serde_json::to_string(&self).unwrap();
-        match std::fs::write(&acme_store_path, acme_store_json) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(Errors::ConfigError(format!(
-                "Unable to save acme store file: {}",
-                e
-            ))),
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -120,36 +71,6 @@ pub struct AcmeAccount {
 }
 
 #[derive(Clone)]
-pub enum BackendType {
-    RoundRobin(Arc<LoadBalancer<Weighted<RoundRobin>>>),
-    Weighted(Arc<LoadBalancer<Weighted<fnv::FnvHasher>>>),
-    Consistent(Arc<LoadBalancer<KetamaHashing>>),
-    Random(Arc<LoadBalancer<Weighted<Random>>>),
-}
-
-// to string
-impl std::fmt::Display for BackendType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BackendType::RoundRobin(v) => {
-                write!(f, "RoundRobin({:#?})", v.backends().get_backend())
-            }
-            BackendType::Weighted(v) => write!(f, "Weighted({:#?})", v.backends().get_backend()),
-            BackendType::Consistent(v) => {
-                write!(f, "Consistent({:#?})", v.backends().get_backend())
-            }
-            BackendType::Random(v) => write!(f, "Random({:#?})", v.backends().get_backend()),
-        }
-    }
-}
-
-impl std::fmt::Debug for BackendType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct HttpService {
     pub name: String,
     pub backend_type: BackendType,
@@ -173,532 +94,216 @@ pub struct ProxyStore {
 }
 
 pub fn acme_store() -> Result<AcmeStore, Errors> {
-    // load the acme store
-    let app_conf = &runtime::config();
-    let acme_store_path = app_conf
+    let path = runtime::config()
         .acme_store
         .clone()
-        .unwrap_or(ACME_STORE_DEFAULT.to_string());
-
-    // read the acme store file or create it
-    let acme_store: AcmeStore = match std::fs::read(&acme_store_path) {
-        Ok(val) => match serde_json::from_slice(&val) {
-            Ok(val) => val,
-            Err(e) => {
-                return Err(Errors::ConfigError(format!(
-                    "Unable to parse acme store file: {}",
-                    e
-                )));
-            }
-        },
+        .unwrap_or_else(|| "/etc/easy-proxy/tls/acme.json".into());
+    match fs::read(&path) {
+        Ok(data) => serde_json::from_slice(&data)
+            .map_err(|e| Errors::ConfigError(format!("Parse acme store: {}", e))),
         Err(_) => {
-            // create the acme store file
-            let acme_store = AcmeStore {
-                hostnames: HashMap::new(),
-                account: HashMap::new(),
-                acme_certs: HashMap::new(),
-                acme_expires: HashMap::new(),
+            let s = AcmeStore {
+                hostnames: Default::default(),
+                account: Default::default(),
+                acme_certs: Default::default(),
+                acme_expires: Default::default(),
             };
-            acme_store.save()?;
-            acme_store
+            s.save()?;
+            Ok(s)
         }
-    };
-    Ok(acme_store)
+    }
 }
 
-pub async fn load(
-    configs: Vec<ProxyConfig>,
-) -> Result<(ProxyStore, HashMap<String, TlsGlobalConfig>), Errors> {
-    let acme_store = acme_store()?;
-    let default_header_selector = "x-easy-proxy-svc";
+impl AcmeStore {
+    pub fn save(&self) -> Result<(), Errors> {
+        let path = runtime::config()
+            .acme_store
+            .clone()
+            .unwrap_or_else(|| "/etc/easy-proxy/tls/acme.json".into());
+        let json = serde_json::to_string(self)
+            .map_err(|e| Errors::ConfigError(format!("Serialize acme store: {}", e)))?;
+        fs::write(&path, json).map_err(|e| Errors::ConfigError(format!("Save acme store: {}", e)))
+    }
+}
+
+pub async fn load(configs: Vec<ProxyConfig>) -> Result<(ProxyStore, HashMap<String, TlsGlobalConfig>), Errors> {
+    let acme = acme_store()?;
     let mut store = ProxyStore {
         header_selector: String::new(),
-        http_services: HashMap::new(),
-        host_routes: HashMap::new(),
-        header_routes: HashMap::new(),
+        http_services: Default::default(),
+        host_routes: Default::default(),
+        header_routes: Default::default(),
     };
-    let mut tls_configs: HashMap<String, TlsGlobalConfig> = HashMap::new();
+    let mut tls_confs = HashMap::new();
+    let mut acme_reqs = Vec::new();
 
-    // Process services
-    for config in configs.iter() {
-        for service in config.services.iter().flatten() {
-            let svc = HttpService {
-                name: service.name.clone(),
-                backend_type: load_backend(service, &service.endpoints).await?,
-            };
-            store.http_services.insert(svc.name.clone(), svc);
+    // services
+    for cfg in &configs {
+        for svc in cfg.services.iter().flatten() {
+            let be = load_backend(svc, &svc.endpoints).await?;
+            store.http_services.insert(svc.name.clone(), HttpService { name: svc.name.clone(), backend_type: be });
         }
     }
 
-    // Process tls
-    let tls: Vec<Tls> = configs
-        .iter()
-        .filter_map(|c| c.tls.clone())
-        .flatten()
-        .collect();
-    // tls name -> domains
-    let mut acme_requests: HashMap<String, Vec<String>> = HashMap::new();
-
-    // Process routes
-    for config in configs.iter() {
-        if !store.header_selector.is_empty() && config.header_selector.is_some() {
-            tracing::warn!("Multiple header selectors found in config files. Using the first one.");
-        } else if let Some(selector) = &config.header_selector {
-            store.header_selector = selector.clone();
+    // tls configs
+    let tls_list: Vec<Tls> = configs.iter().filter_map(|c| c.tls.clone()).flatten().collect();
+    let mut acme_queue: HashMap<String, Vec<String>> = HashMap::new();
+    for cfg in &configs {
+        if store.header_selector.is_empty() {
+            if let Some(hs) = &cfg.header_selector {
+                store.header_selector = hs.clone();
+            }
         }
-        for route in config.routes.iter().flatten() {
-            if route.route.condition_type == *"host" {
-                if let Some(r_tls) = &route.tls {
-                    if let Some(tls) = tls.iter().find(|t| t.name == r_tls.name) {
-                        let hosts: Vec<String> = route
-                            .route
-                            .value
-                            .split('|')
-                            .map(|s| s.to_string())
-                            .collect();
-                        for host in hosts.clone() {
-                            let host = match host.split(':').next() {
-                                Some(val) => val,
-                                None => {
-                                    return Err(Errors::ConfigError(
-                                        "Unable to parse host".to_string(),
-                                    ));
-                                }
-                            };
-                            let Some(cert) = load_cert(&acme_store, tls, host, &mut acme_requests)?
-                            else {
-                                tracing::warn!("No cert found for host: {}", host);
-                                continue;
-                            };
-                            tls_configs.insert(host.to_string(), cert);
-                        }
-                    } else {
-                        return Err(Errors::ConfigError(format!(
-                            "No tls found for route: {:?}",
-                            route
-                        )));
-                    }
+        for r in cfg.routes.iter().flatten() {
+            let mut router = matchit::Router::new();
+            for p in r.paths.iter().flatten() {
+                let rt = Route { path: p.clone(), service: p.service.clone(), remove_headers: r.remove_headers.clone(), add_headers: r.add_headers.clone(), tls: r.tls.clone() };
+                router.insert(&p.path, rt.clone())
+                    .map_err(|e| Errors::ConfigError(format!("Route insert: {}", e)))?;
+                if p.path_type == "Prefix" {
+                    let mp = if &p.path == "/" { "/{*p}" } else { &format!("{}/{{*p}}", p.path) };
+                    router.insert(mp, rt).map_err(|e| Errors::ConfigError(format!("Route insert: {}", e)))?;
                 }
             }
-            let mut routes = matchit::Router::<Route>::new();
-            for path in route.paths.iter().flatten() {
-                let path_type = path.path_type.clone();
-                let r = Route {
-                    path: path.clone(),
-                    service: path.service.clone(),
-                    remove_headers: route.remove_headers.clone(),
-                    add_headers: route.add_headers.clone(),
-                    tls: route.tls.clone(),
-                };
-                match routes.insert(path.path.clone(), r.clone()) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(Errors::ConfigError(format!(
-                            "Unable to insert route: {:?}",
-                            e
-                        )));
-                    }
-                }
-                if path_type == *"Prefix" {
-                    let mut match_path = format!("{}/{{*p}}", path.path.clone());
-                    if path.path.clone() == *"/" {
-                        match_path = "/{*p}".to_string();
-                    }
-                    match routes.insert(match_path, r) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            return Err(Errors::ConfigError(format!(
-                                "Unable to insert route: {:?}",
-                                e
-                            )));
+            if r.route.condition_type == "host" {
+                for host in r.route.value.split('|') {
+                    if let Some(tr) = &r.tls {
+                        if let Some(t) = tls_list.iter().find(|t| t.name == tr.name) {
+                            if let Some(conf) = load_cert(&acme, t, host.split(':').next().unwrap_or(host), &mut acme_queue)? {
+                                tls_confs.insert(host.to_string(), conf);
+                            }
                         }
                     }
-                }
-            }
-            if route.route.condition_type == *"host" {
-                let hosts: Vec<&str> = route.route.value.split('|').collect();
-                for host in hosts {
-                    store.host_routes.insert(host.to_string(), routes.clone());
+                    store.host_routes.insert(host.to_string(), router.clone());
                 }
             } else {
-                store
-                    .header_routes
-                    .insert(route.route.value.clone(), routes);
+                store.header_routes.insert(r.route.value.clone(), router);
             }
         }
     }
-
-    // Set the default header selector if none is found
     if store.header_selector.is_empty() {
-        store.header_selector = default_header_selector.to_string();
+        store.header_selector = "x-easy-proxy-svc".into();
     }
-
-    if !acme_requests.is_empty() {
-        for (tls_name, domains) in acme_requests.iter() {
-            let tls = tls.iter().find(|t| t.name == *tls_name);
-            if let Some(tls) = tls {
-                if let Some(acme) = &tls.acme {
-                    set_acme_request(tls_name.clone(), acme.clone(), domains.clone());
-                }
-            }
+    // queue acme
+    for (name, domains) in acme_queue {
+        if let Some(t) = tls_list.iter().find(|t| t.name == name) {
+            ACME_REQUEST_QUEUE.lock().unwrap().insert(name.clone(), (t.clone(), domains.clone()));
         }
     }
 
-    Ok((store, tls_configs))
-}
-
-pub fn set(conf: (ProxyStore, HashMap<String, TlsGlobalConfig>)) {
-    // reset acme retry count
-    unsafe {
-        ACME_RETRY_COUNT = Box::into_raw(Box::new(HashMap::new()));
-    }
-    unsafe {
-        GLOBAL_PROXY_CONFIG = Box::into_raw(Box::new(conf.0));
-    }
-    unsafe {
-        GLOBAL_TLS_CONFIG = Box::into_raw(Box::new(conf.1));
-    }
+    PROXY_STORE.set(store.clone()).ok();
+    TLS_CONFIG.set(tls_confs.clone()).ok();
+    Ok((store, tls_confs))
 }
 
 pub fn get() -> Option<&'static ProxyStore> {
-    unsafe {
-        if GLOBAL_PROXY_CONFIG.is_null() {
-            None
-        } else {
-            Some(&*GLOBAL_PROXY_CONFIG)
-        }
-    }
+    PROXY_STORE.get()
 }
 
 pub fn get_tls() -> Option<&'static HashMap<String, TlsGlobalConfig>> {
-    unsafe {
-        if GLOBAL_TLS_CONFIG.is_null() {
-            None
-        } else {
-            Some(&*GLOBAL_TLS_CONFIG)
-        }
-    }
+    TLS_CONFIG.get()
 }
 
-// ACME_REQUEST_QUEUE
-// - key: tls name
-// - value: email, vec<domain>
 pub async fn acme_request_queue() {
-    unsafe {
-        if ACME_IN_PROGRESS {
-            return;
-        }
-        if !ACME_REQUEST_QUEUE.is_null() {
-            let queue = &*ACME_REQUEST_QUEUE;
-            for (tls_name, (acme, domains)) in queue.iter() {
-                ACME_IN_PROGRESS = true;
-                tracing::info!("Generating acme cert for: {}", tls_name);
-                tracing::info!("Email: {}", acme.email);
-                tracing::info!("Domains: {:?}", domains);
-                match acme_request(tls_name, acme, domains).await {
-                    Ok(_) => {
-                        tracing::info!("Acme cert generated for: {}", tls_name);
-                    }
-                    Err(e) => {
-                        tracing::error!("Error generating acme cert: {:?}", e);
-                        let retry_count = if ACME_RETRY_COUNT.is_null() {
-                            let mut retry_count = HashMap::new();
-                            retry_count.insert(tls_name.clone(), 1);
-                            ACME_RETRY_COUNT = Box::into_raw(Box::new(retry_count));
-                            1
-                        } else {
-                            let retry_count = &mut *ACME_RETRY_COUNT;
-                            match retry_count.get_mut(tls_name) {
-                                Some(val) => {
-                                    *val += 1;
-                                    *val
-                                }
-                                None => {
-                                    retry_count.insert(tls_name.clone(), 1);
-                                    1
-                                }
-                            }
-                        };
-                        if retry_count > 2 {
-                            tracing::error!("Max retry count reached for: {}", tls_name);
-                        } else {
-                            let tls_name = tls_name.clone();
-                            let domains = domains.clone();
-                            let acme = acme.clone();
-                            std::thread::spawn(move || {
-                                std::thread::sleep(std::time::Duration::from_secs(60));
-                                tracing::info!("Retrying acme cert generation for: {}", tls_name);
-                                set_acme_request(tls_name, acme, domains);
-                            });
-                        }
-                    }
-                }
-                remove_acme_request(tls_name);
-            }
-            ACME_IN_PROGRESS = false;
-        } else {
-            ACME_IN_PROGRESS = false;
-        }
-    }
-}
-pub fn set_acme_request(tls_name: String, acme: Acme, domains: Vec<String>) {
-    unsafe {
-        if ACME_REQUEST_QUEUE.is_null() {
-            let mut queue = HashMap::new();
-            queue.insert(tls_name, (acme, domains));
-            ACME_REQUEST_QUEUE = Box::into_raw(Box::new(queue));
-        } else {
-            let queue = &mut *ACME_REQUEST_QUEUE;
-            if let Some((_, val)) = queue.iter_mut().next() {
-                for domain in domains.iter() {
-                    if !val.1.contains(domain) {
-                        val.1.push(domain.clone());
-                    }
-                }
-            }
-            queue.insert(tls_name, (acme, domains));
-        }
-    }
-}
-pub fn remove_acme_request(tls_name: &str) {
-    unsafe {
-        if ACME_REQUEST_QUEUE.is_null() {
-            return;
-        }
-        let queue = &mut *ACME_REQUEST_QUEUE;
-        queue.remove(tls_name);
-    }
-}
-pub async fn acme_request(tls_name: &str, acme: &Acme, domains: &[String]) -> Result<(), Errors> {
-    let mut acme_store = acme_store()?;
-    let provider = acme.provider.clone().unwrap_or(AcmeProvider::LetsEncrypt);
-    let directory_url = ACME_PROVIDERS
-        .get(&provider)
-        .ok_or(Errors::AcmeClientError("No provider found".to_string()))?;
-    let acme_client = AcmeClient::new(directory_url).await?;
-    let email = acme.email.clone();
-    let account = acme_store.account.get(&email);
-    let account = account.filter(|&val| val.0 == provider.to_string());
-    let account = match account {
-        Some(val) => (val.1.kid.clone(), val.1.key_pair.clone()),
-        None => {
-            // Generate a key pair for testing
-            let key_pair = AcmeKeyPair::generate()?;
-            let emails = [email.as_str()];
-            let kid = acme_client.create_account(&key_pair, &emails).await?;
-            acme_store.account.insert(
-                email,
-                (
-                    acme.provider
-                        .clone()
-                        .unwrap_or(AcmeProvider::LetsEncrypt)
-                        .to_string(),
-                    AcmeAccount {
-                        kid: kid.clone(),
-                        key_pair: key_pair.pkcs8_bytes.clone(),
-                    },
-                ),
-            );
-            acme_store.save()?;
-            (kid, key_pair.pkcs8_bytes)
-        }
-    };
-    let key_pair = AcmeKeyPair::from_pkcs8(&account.1)?;
-    let kid = account.0.clone();
-    let domains = domains.iter().map(|d| d.as_str()).collect::<Vec<&str>>();
-    let (order_url, order) = acme_client.create_order(&key_pair, &kid, &domains).await?;
-    // println!("Order: {:#?}", order);
-    // Get the authorization URL from the order
-    let auth_url = order["authorizations"][0]
-        .as_str()
-        .ok_or(Errors::AcmeClientError("No authorization URL".to_string()))?;
-
-    // Get the HTTP challenge
-    let (challenge_url, _token, key_authorization) = acme_client
-        .get_http_challenge(&key_pair, &kid, auth_url)
-        .await?;
-
-    // println!("Token: {}", token);
-    // Token: Hizsjv2eU5pHC-D2Lxzz3aEzi0AzrQaFZPqWe-A4Nxw
-    // println!("Key Authorization {}", key_authorization);
-    // Key Authorization Hizsjv2eU5pHC-D2Lxzz3aEzi0AzrQaFZPqWe-A4Nxw.ZY04uJEvf6QDHa1ciRK_4jcGKh_D0EkLUv5Ox4WW1uI
-    for domain in domains.iter() {
-        acme_set_authz(domain, &key_authorization);
-    }
-
-    acme_client
-        .validate_challenge(&key_pair, &kid, &challenge_url)
-        .await?;
-
-    // csr
-    let (csr_der, private_key_der) = acme_client.create_csr(&domains)?;
-    // finalize order
-    let finalize_url = order["finalize"]
-        .as_str()
-        .ok_or(Errors::AcmeClientError("No finalize URL".to_string()))?;
-    let _finalize_order = acme_client
-        .finalize_order(&key_pair, &kid, finalize_url, &csr_der)
-        .await?;
-    /*
-    println!("finalize_orde: {:?}", finalize_order);
-    finalize_orde: Object {"authorizations": Array [String("https://acme-staging-v02.api.letsencrypt.org/acme/authz-v3/14726370293")],
-        "expires": String("2024-11-10T08:15:02Z"),
-        "finalize": String("https://acme-staging-v02.api.letsencrypt.org/acme/finalize/169799563/20198604123"),
-        "identifiers": Array [Object {"type": String("dns"),
-        "value": String("easy-proxy-dev.assetsart.com")}], "status": String("processing")
-    }
-    */
-    let valid_order = acme_client
-        .wait_for_order_valid(&key_pair, &kid, &order_url)
-        .await?;
-    /*
-    println!("Valid order: {:?}", valid_order);
-    Valid order: Object {"authorizations": Array [String("https://acme-staging-v02.api.letsencrypt.org/acme/authz-v3/14726370293")],
-    "certificate": String("https://acme-staging-v02.api.letsencrypt.org/acme/cert/2b3497dd2c93026a2ecc5b0759fef2c42f5a"),
-    "expires": String("2024-11-10T08:15:02Z"), "finalize": String("https://acme-staging-v02.api.letsencrypt.org/acme/finalize/169799563/20198604123"),
-    "identifiers": Array [Object {"type": String("dns"), "value": String("easy-proxy-dev.assetsart.com")}],
-    "status": String("valid")}
-    */
-    // download cert
-    let cert_url = valid_order["certificate"]
-        .as_str()
-        .ok_or(Errors::AcmeClientError("No certificate URL".to_string()))?;
-    let cert_pem = acme_client
-        .download_certificate(&key_pair, &kid, cert_url)
-        .await?;
-    // println!("Cert: {}", cert_pem);
-    let cert_pems: Vec<String> = cert_pem
-        .split("-----BEGIN CERTIFICATE-----")
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            // add -----BEGIN CERTIFICATE-----
-            format!("-----BEGIN CERTIFICATE-----\n{}", s)
-        })
-        .collect();
-    if cert_pems.len() < 2 {
-        return Err(Errors::AcmeClientError("Invalid cert".to_string()));
-    }
-    let order_id = cert_url.split("/").last();
-    let Some(order_id) = order_id else {
-        return Err(Errors::AcmeClientError("No order id".to_string()));
-    };
-    let cert = X509::from_pem(cert_pems[0].as_bytes())
-        .map_err(|_| Errors::AcmeClientError("Unable to parse cert".to_string()))?;
-    let expiry = utils::asn1_time_to_unix_time(cert.not_after())
-        .map_err(|e| Errors::AcmeClientError(format!("Unable to parse cert expiry: {}", e)))?;
-    acme_store
-        .acme_expires
-        .insert(order_id.to_string(), (tls_name.to_string(), expiry));
-    let chain = cert_pems[1..]
-        .iter()
-        .map(|c| {
-            X509::from_pem(c.as_bytes())
-                .map_err(|_| Errors::AcmeClientError("Unable to parse chain".to_string()))
-        })
-        .collect::<Result<Vec<X509>, Errors>>()?;
-    acme_store.acme_certs.insert(
-        order_id.to_string(),
-        AcmeCertificate {
-            account_kid: kid,
-            key_der: private_key_der.clone(),
-            cert: cert
-                .to_pem()
-                .map_err(|_| Errors::AcmeClientError("Unable to parse cert".to_string()))?,
-            csr: csr_der.clone(),
-            chain: chain
-                .iter()
-                .map(|c| {
-                    c.to_pem()
-                        .map_err(|_| Errors::AcmeClientError("Unable to parse chain".to_string()))
-                })
-                .collect::<Result<Vec<Vec<u8>>, Errors>>()?,
-        },
-    );
-    for domain in domains.iter() {
-        acme_store
-            .hostnames
-            .insert(domain.to_string(), order_id.to_string());
-    }
-    acme_store.save()?;
-    // get_tls
-    let tls_configs = get_tls();
-    let tls_configs = match tls_configs {
-        Some(val) => val,
-        None => {
-            return Err(Errors::ConfigError("No tls configs found".to_string()));
-        }
-    };
-    let mut new_tls_configs: HashMap<String, TlsGlobalConfig> = HashMap::new();
-    for tls in tls_configs.iter() {
-        new_tls_configs.insert(tls.0.clone(), tls.1.clone());
-    }
-    for domain in domains.iter() {
-        let key = match PKey::private_key_from_der(&private_key_der) {
-            Ok(val) => val,
+    if ACME_IN_PROGRESS.compare_and_swap(false, true, Ordering::SeqCst) { return; }
+    let mut q = ACME_REQUEST_QUEUE.lock().unwrap();
+    for (name, (acme, domains)) in q.clone() {
+        match acme_request(&name, &acme, &domains).await {
+            Ok(_) => tracing::info!("ACME cert generated: {}", name),
             Err(e) => {
-                return Err(Errors::ConfigError(format!(
-                    "Unable to parse key file: {}",
-                    e
-                )));
+                tracing::error!("ACME error {}: {:?}", name, e);
+                let mut rc = ACME_RETRY_COUNT.lock().unwrap();
+                let cnt = rc.entry(name.clone()).and_modify(|c| *c += 1).or_insert(1);
+                if *cnt <= 2 {
+                    let name2 = name.clone();
+                    let acme2 = acme.clone();
+                    let dom2 = domains.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                        set_acme_request(name2, acme2, dom2);
+                    });
+                } else {
+                    tracing::error!("Max retries for {}", name);
+                }
             }
-        };
-        let tls = TlsGlobalConfig {
-            cert: cert.clone(),
-            key,
-            chain: chain.clone(),
-        };
-        new_tls_configs.insert(domain.to_string(), tls);
+        }
+        q.remove(&name);
     }
-    unsafe {
-        GLOBAL_TLS_CONFIG = Box::into_raw(Box::new(new_tls_configs));
+    ACME_IN_PROGRESS.store(false, Ordering::SeqCst);
+}
+
+pub fn set_acme_request(name: String, acme: Acme, domains: Vec<String>) {
+    let mut q = ACME_REQUEST_QUEUE.lock().unwrap();
+    q.entry(name).or_default().1.extend(domains);
+}
+
+pub fn remove_acme_request(name: &str) {
+    ACME_REQUEST_QUEUE.lock().unwrap().remove(name);
+}
+
+pub fn acme_set_authz(domain: &str, authz: &str) {
+    ACME_AUTHZ.lock().unwrap().insert(domain.to_string(), authz.to_string());
+}
+
+pub fn acme_get_authz(domain: &str) -> Option<String> {
+    ACME_AUTHZ.lock().unwrap().get(domain).cloned()
+}
+
+pub async fn acme_request(tls_name: &str, acme: &Acme, domains: &[String]) -> Result<(), Errors> {
+    let mut store = acme_store()?;
+    let provider = acme.provider.clone().unwrap_or(AcmeProvider::LetsEncrypt);
+    let url = ACME_PROVIDERS.get(&provider).ok_or_else(|| Errors::AcmeClientError("No provider".into()))?;
+    let client = AcmeClient::new(url).await?;
+    let email = &acme.email;
+    let (kid, key_bytes) = match store.account.get(email).filter(|(p,_)| *p == provider.to_string()) {
+        Some((_, acc)) => (acc.kid.clone(), acc.key_pair.clone()),
+        None => {
+            let kp = AcmeKeyPair::generate()?;
+            let kid = client.create_account(&kp, &[email]).await?;
+            store.account.insert(email.clone(), (provider.to_string(), AcmeAccount { kid: kid.clone(), key_pair: kp.pkcs8_bytes.clone() }));
+            store.save()?;
+            (kid, kp.pkcs8_bytes)
+        }
+    };
+    let kp = AcmeKeyPair::from_pkcs8(&key_bytes)?;
+    let doms: Vec<&str> = domains.iter().map(|d| d.as_str()).collect();
+    let (order_url, order) = client.create_order(&kp, &kid, &doms).await?;
+    let authz_url = order["authorizations"][0].as_str().ok_or(Errors::AcmeClientError("No authz".into()))?;
+    let (_url, _tok, key_auth) = client.get_http_challenge(&kp, &kid, authz_url).await?;
+    for d in &doms { acme_set_authz(d, &key_auth); }
+    client.validate_challenge(&kp, &kid, _url).await?;
+    let (csr, pk) = client.create_csr(&doms)?;
+    let finalize = order["finalize"].as_str().ok_or(Errors::AcmeClientError("No finalize".into()))?;
+    client.finalize_order(&kp, &kid, finalize, &csr).await?;
+    let valid = client.wait_for_order_valid(&kp, &kid, &order_url).await?;
+    let cert_url = valid["certificate"].as_str().ok_or(Errors::AcmeClientError("No cert URL".into()))?;
+    let pem = client.download_certificate(&kp, &kid, cert_url).await?;
+    let parts: Vec<&[u8]> = pem.split("-----BEGIN CERTIFICATE-----").filter(|s| !s.is_empty()).map(|s| format!("-----BEGIN CERTIFICATE-----{}", s).as_bytes()).collect();
+    if parts.len() < 2 { return Err(Errors::AcmeClientError("Invalid PEM".into())); }
+    let cert = X509::from_pem(parts[0]).map_err(|_| Errors::AcmeClientError("Parse cert".into()))?;
+    let expiry = utils::asn1_time_to_unix_time(cert.not_after()).map_err(|e| Errors::AcmeClientError(format!("{}", e)))?;
+    store.acme_expires.insert(order_url.split('/').last().unwrap().into(), (tls_name.into(), expiry));
+    let chain = parts[1..].iter().map(|pem| X509::from_pem(pem).map_err(|_| Errors::AcmeClientError("Parse chain".into()))).collect::<Result<Vec<_>, _>>()?;
+    store.acme_certs.insert(order_url.clone(), AcmeCertificate { account_kid: kid.clone(), key_der: pk.clone(), cert: cert.to_pem().unwrap(), csr: csr.clone(), chain: chain.iter().map(|c| c.to_pem().unwrap()).collect() });
+    for d in &domains { store.hostnames.insert(d.clone(), order_url.clone()); }
+    store.save()?;
+    // update global TLS_CONFIG
+    if let Some(mut cfgs) = TLS_CONFIG.get().cloned() {
+        let key = PKey::private_key_from_der(&pk).map_err(|e| Errors::ConfigError(format!("{}", e)))?;
+        let conf = TlsGlobalConfig { cert: cert.clone(), key, chain: chain.clone() };
+        for d in domains { cfgs.insert(d.clone(), conf.clone()); }
+        TLS_CONFIG.set(cfgs).ok();
     }
     Ok(())
 }
-// ACME_AUTHZ
-pub fn acme_set_authz(domain: &str, authz: &str) {
-    unsafe {
-        if ACME_AUTHZ.is_null() {
-            let mut authz_map = HashMap::new();
-            authz_map.insert(domain.to_string(), authz.to_string());
-            ACME_AUTHZ = Box::into_raw(Box::new(authz_map));
-        } else {
-            let authz_map = &mut *ACME_AUTHZ;
-            authz_map.insert(domain.to_string(), authz.to_string());
-        }
-    }
-}
-pub fn acme_get_authz(domain: &str) -> Option<String> {
-    unsafe {
-        if ACME_AUTHZ.is_null() {
-            None
-        } else {
-            let authz_map = &*ACME_AUTHZ;
-            authz_map.get(domain).cloned()
-        }
-    }
-}
+
 pub async fn acme_renew() -> Result<(), Errors> {
-    let acme_store = acme_store()?;
-    let acme_requests = acme_store.acme_expires.clone();
-    let is_expired = acme_requests.iter().any(|(_, (tls_name, expiry))| {
-        let expiry = expiry - 432000;
-        let now = chrono::Utc::now().timestamp() as i128;
-        // 5 days before expiry
-        let is_expiry = expiry < now;
-        if is_expiry {
-            tracing::info!("Reloading config for acme renew: {}", tls_name);
-        }
-        is_expiry
-    });
-    if is_expired {
-        let configs = read().await?;
-        match load(configs).await {
-            Ok(conf) => {
-                set(conf);
-            }
-            Err(e) => {
-                return Err(e);
-            }
+    let store = acme_store()?;
+    let now = chrono::Utc::now().timestamp() as i128;
+    if store.acme_expires.values().any(|(_, exp)| exp - 432_000 < now) {
+        if let Ok((ps, tls)) = load(super::proxy::read().await?).await {
+            PROXY_STORE.set(ps).ok();
+            TLS_CONFIG.set(tls).ok();
         }
     }
     Ok(())

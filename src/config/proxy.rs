@@ -1,6 +1,11 @@
 use crate::{config::runtime, errors::Errors};
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::BufReader, path::PathBuf};
+use std::{
+    fs,
+    fs::File,
+    io::BufReader,
+    path::{Path, PathBuf},
+};
 
 use super::store;
 
@@ -112,74 +117,48 @@ pub struct ServiceReference {
     pub rewrite: Option<String>,
 }
 
-pub fn read_dir_recursive(dir: &String, max_depth: usize) -> Result<Vec<PathBuf>, Errors> {
+/// Recursively list all files under `dir` up to `max_depth`.
+fn read_dir_recursive(dir: &Path, max_depth: usize) -> Result<Vec<PathBuf>, Errors> {
     let mut files = Vec::new();
-    let path_buf = PathBuf::from(dir);
-    for entry in std::fs::read_dir(path_buf).map_err(|e| {
-        Errors::ConfigError(format!("Unable to read config directory {:?}: {}", dir, e))
+    for entry in fs::read_dir(dir).map_err(|e| {
+        Errors::ConfigError(format!("Failed to read directory {}: {}", dir.display(), e))
     })? {
         let entry = entry.map_err(|e| {
-            Errors::ConfigError(format!(
-                "Unable to read file in config directory {:?}: {}",
-                dir, e
-            ))
+            Errors::ConfigError(format!("Failed to access entry in {}: {}", dir.display(), e))
         })?;
         let path = entry.path();
-        if path.is_dir() {
-            if max_depth > 0 {
-                files.append(&mut read_dir_recursive(
-                    &path.to_string_lossy().to_string(),
-                    max_depth - 1,
-                )?);
-            }
-        } else {
+        if path.is_dir() && max_depth > 0 {
+            files.extend(read_dir_recursive(&path, max_depth - 1)?);
+        } else if path.is_file() {
             files.push(path);
         }
     }
     Ok(files)
 }
 
+/// Load all proxy configs from files under `config_dir`.
 pub async fn read() -> Result<Vec<ProxyConfig>, Errors> {
     let conf = runtime::config();
-    let confid_dir = conf.config_dir.clone();
-    let proxy_conf_path = PathBuf::from(confid_dir);
-    let files =
-        read_dir_recursive(&proxy_conf_path.to_string_lossy().to_string(), 6).map_err(|e| {
-            Errors::ConfigError(format!(
-                "Unable to read config directory {:?}: {}",
-                proxy_conf_path, e
-            ))
+    let config_dir = Path::new(&conf.config_dir);
+    let files = read_dir_recursive(config_dir, 6)?;
+    let mut configs = Vec::with_capacity(files.len());
+    for path in files {
+        let file = File::open(&path).map_err(|e| {
+            Errors::ConfigError(format!("Failed to open {}: {}", path.display(), e))
         })?;
-    let mut configs: Vec<ProxyConfig> = Vec::new();
-    // println!("Reading config files: {:?}", files);
-    for file_path in files {
-        let file = File::open(&file_path).map_err(|e| {
-            Errors::ConfigError(format!(
-                "Unable to open config file {:?}: {}",
-                proxy_conf_path, e
-            ))
-        })?;
-        let reader = BufReader::new(file);
-        let config: ProxyConfig = serde_yml::from_reader(reader).map_err(|e| {
-            Errors::ConfigError(format!(
-                "Unable to parse config file {:?}: {}",
-                file_path, e
-            ))
-        })?;
-        configs.push(config);
+        let cfg: ProxyConfig =
+            serde_yaml::from_reader(BufReader::new(file)).map_err(|e| {
+                Errors::ConfigError(format!("Failed to parse {}: {}", path.display(), e))
+            })?;
+        configs.push(cfg);
     }
     Ok(configs)
 }
 
+/// Read and store the merged proxy configuration.
 pub async fn load() -> Result<(), Errors> {
     let configs = read().await?;
-    match store::load(configs).await {
-        Ok(conf) => {
-            store::set(conf);
-        }
-        Err(e) => {
-            return Err(e);
-        }
-    }
+    let merged = store::load(configs).await?;
+    store::set(merged);
     Ok(())
 }

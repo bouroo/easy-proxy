@@ -2,22 +2,20 @@ use openssl::{
     asn1::{Asn1Time, Asn1TimeRef},
     error::ErrorStack,
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn asn1_time_to_unix_time(time: &Asn1TimeRef) -> Result<i128, ErrorStack> {
-    let threshold = Asn1Time::days_from_now(0).unwrap();
-    let time = threshold.diff(time)?;
-    let days = time.days; // Difference in days
-    let seconds = time.secs; // This is always less than the number of seconds in a day.
-    let duration = Duration::from_secs((days as u64) * 86400 + seconds as u64);
-    let epoch = SystemTime::UNIX_EPOCH;
-    let since_the_epoch = match epoch.checked_add(duration) {
-        Some(val) => val,
-        None => {
-            return Err(ErrorStack::get());
-        }
-    };
-    let time = chrono::DateTime::<chrono::Utc>::from(since_the_epoch).timestamp() as i128;
-    let now = chrono::Utc::now().timestamp() as i128;
-    Ok(time + now)
+    // get "now" as an ASN.1 time
+    let now_asn1 = Asn1Time::days_from_now(0)?;
+    // compute difference (days, secs) between now and the provided time
+    let diff = now_asn1.diff(time)?;
+    // total diff in seconds
+    let delta_secs = diff.days as u64 * 86_400 + diff.secs as u64;
+    // current UNIX timestamp
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ErrorStack::get())?
+        .as_secs() as i128;
+    // return delta + now
+    Ok(delta_secs as i128 + now_secs)
 }
